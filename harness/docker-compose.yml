@@ -1,0 +1,29 @@
+services:
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports: ["5672:5672", "15672:15672"]   # AMQP, management UI (guest/guest)
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: nomly
+      POSTGRES_PASSWORD: nomly
+      POSTGRES_DB: nomly
+    ports: ["5432:5432"]
+    volumes:
+      - ./seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+
+  adminer:
+    image: adminer
+    depends_on: [postgres]
+    ports: ["8081:8080"]
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres   # so you only type user/password/db
+
+  producer:
+    image: python:3.12-slim
+    depends_on: [rabbitmq]
+    restart: unless-stopped
+    volumes:
+      - ./producer.py:/producer.py:ro
+    command: sh -c "pip install -q --disable-pip-version-check --root-user-action=ignore pika && python -u /producer.py"
