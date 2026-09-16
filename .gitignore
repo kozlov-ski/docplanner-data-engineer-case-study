@@ -9,3 +9,4 @@ harness/ingestion/.venv/
 harness/ingestion/.uv-cache/
 harness/ingestion/__pycache__/
 harness/ingestion/evidence.json
+resources/*.epub

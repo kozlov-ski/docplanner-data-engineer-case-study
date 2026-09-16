@@ -6,7 +6,7 @@ models:
     columns:
       - name: window_start
         description: Inclusive start of a five-minute UTC window.
-        data_type: timestamp with time zone
+        data_type: timestamp(6) with time zone
         data_tests: [not_null, unique]
       - name: delivered_events
         description: Number of accepted unique event IDs in the window.

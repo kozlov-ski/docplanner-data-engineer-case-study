@@ -5,6 +5,18 @@ up:
     {{ compose }} up -d --wait --wait-timeout 240
     uv run --locked harness/ingestion/consume.py
 
+# Build and test delivery-event counts from the current Bronze data.
+dbt vars='{}':
+    uv run --locked --project dbt_project dbt build --project-dir dbt_project --profiles-dir dbt_project --vars {{ quote(vars) }}
+
+# Test existing models; run just dbt first to include new Bronze arrivals.
+dbt-test:
+    uv run --locked --project dbt_project dbt test --project-dir dbt_project --profiles-dir dbt_project
+
+# Build/test live models, then verify replay, conflicts and window assumptions in isolation.
+dbt-verify: dbt
+    uv run --locked --project dbt_project python dbt_project/verify.py
+
 # Require recent rows and a real Parquet object in MinIO.
 check:
     #!/bin/sh

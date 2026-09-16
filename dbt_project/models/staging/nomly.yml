@@ -2,45 +2,82 @@ version: 2
 
 sources:
   - name: nomly
-    schema: "{{ env_var('NOMLY_RAW_SCHEMA', 'raw') }}"
-    description: Validated delivery events ingested from RabbitMQ; rejected bytes are quarantined separately.
+    database: "{{ env_var('TRINO_CATALOG', 'lakehouse') }}"
+    schema: "{{ env_var('NOMLY_RAW_SCHEMA', 'bronze') }}"
+    description: Append-only raw RabbitMQ bytes in Iceberg; duplicates and malformed payloads are intentional.
     tables:
-      - name: deliveries
-        description: One accepted payload per event ID; identical retries do not change the row.
+      - name: raw_order_events
+        description: All event types and their broker receipt metadata; ingestion is independent of dbt.
         config:
           meta:
-            event_type: order_delivered
-            owner: dispatch
+            owner: platform
             freshness_class: critical
         columns:
-          - name: event_id
-            description: Producer event identifier and ingestion deduplication key.
-            data_tests: [not_null, unique]
-          - name: order_id
-            description: Order identifier; event counts are not guaranteed to be distinct order counts.
-            data_tests: [not_null]
-          - name: occurred_at
-            description: Source event time, normalized to UTC; determines the business window.
-            data_tests: [not_null]
-          - name: ingested_at
-            description: First accepted receipt time; unchanged on replay.
-            data_tests: [not_null]
           - name: payload
-            description: Complete accepted JSON payload, including additional fields.
+            description: Original message bytes, including additional event fields.
+          - name: ingested_at
+            description: UTC receipt timestamp; not the business event timestamp.
+          - name: exchange
+            description: RabbitMQ exchange.
+          - name: routing_key
+            description: RabbitMQ routing key, normally the event type.
+          - name: redelivered
+            description: Broker redelivery flag, not a complete duplicate indicator.
+          - name: batch_id
+            description: Raw ingestion batch identifier.
 
 models:
+  - name: stg_nomly__delivery_inputs
+    description: >
+      Incrementally captured delivery candidates (routing key or JSON event type is order_delivered).
+      Append each batch/UTC ingestion-day once within a configurable window (current and previous day by default).
+      Require unique, immutable, atomically committed raw batch IDs; partition this table by day(ingested_at).
+      Preserve repeated messages within and across batches. Full-refresh after source corrections or SQL changes.
+      Retains rejected bytes and a rejection reason; conflicting bytes for an event ID
+      fail the build before counts are replaced. Timestamps support up to six fractional digits.
+    columns:
+      - name: payload
+        description: Original bytes retained for validation and strict duplicate comparison.
+      - name: ingested_at
+        description: Original UTC receipt timestamp.
+      - name: exchange
+        description: Original broker exchange.
+      - name: routing_key
+        description: Original broker routing key.
+      - name: redelivered
+        description: Original broker redelivery flag.
+      - name: batch_id
+        description: Original ingestion batch identifier.
+      - name: event_id
+        description: Normalized UUID if parseable; also used to detect conflicts in rejected input.
+      - name: order_id
+        description: Normalized order UUID if parseable.
+      - name: event_type
+        description: Declared JSON event type.
+      - name: occurred_at
+        description: Parsed UTC occurrence timestamp; usable only when rejection_reason is null.
+      - name: rejection_reason
+        description: First validation failure, or null for a valid delivery candidate.
+
   - name: stg_nomly__deliveries
-    description: Typed delivery-event detail for analyst models; validation and deduplication happen at ingestion.
+    description: Valid delivery events deduplicated by event ID in a view over captured inputs; use only after a successful conflict-gated build.
     config:
-      meta:
-        owner: dispatch
-        freshness_class: critical
+      contract:
+        enforced: true
     columns:
       - name: event_id
-        description: Unique event identifier.
+        description: Unique normalized event UUID.
+        data_type: varchar
+        data_tests: [not_null, unique]
       - name: order_id
-        description: Order identifier.
+        description: Normalized order UUID; event counts are not distinct order counts.
+        data_type: varchar
+        data_tests: [not_null]
       - name: occurred_at
-        description: Delivery occurrence time.
+        description: UTC delivery occurrence time.
+        data_type: timestamp(6) with time zone
+        data_tests: [not_null]
       - name: ingested_at
-        description: First accepted receipt time.
+        description: Earliest receipt timestamp, unchanged by later identical retries.
+        data_type: timestamp(6) with time zone
+        data_tests: [not_null]

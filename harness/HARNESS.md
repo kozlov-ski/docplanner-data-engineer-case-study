@@ -88,6 +88,17 @@ for method, props, body in ch.consume("orders"):
 These are the slow-moving dimensions. `restaurants.zone_id` is how you get from an event
 to a zone.
 
+Trino exposes these lookups through `postgres.public`. After a successful dbt build,
+join delivery detail to current restaurant/zone values with:
+
+```bash
+docker compose -f harness/docker-compose.yml exec -T trino trino --file /lakehouse/delivery_lookup.sql
+```
+
+This exploratory query scans raw `order_placed` events for the restaurant mapping;
+missing, invalid or conflicting mappings leave lookup columns null. It preserves delivery
+rows but does not establish historical attribution or validated order facts.
+
 ## Two things to know
 
 **The clock runs at 60x.** One real second is one simulated minute, so a few minutes of
@@ -180,5 +191,107 @@ docker compose -f harness/docker-compose.yml logs postgres minio trino
 The root `just stop` preserves containers and data. `just nuke` deletes this Compose project's
 containers and attached volumes, including Postgres, RabbitMQ and MinIO data. Stop the foreground
 consumer first. It does not prune unrelated Docker resources or remove previously detached volumes.
+
+## Delivery-event counts with dbt
+
+Run `just dbt` from the repository root after landing some events. It installs the locked
+Python 3.12 dbt environment and runs `dbt build` against Trino; ingestion can continue.
+Run only one dbt build at a time. Each build appends new delivery-candidate batches to
+the Iceberg table `lakehouse.analytics.stg_nomly__delivery_inputs`. The view
+`stg_nomly__deliveries` validates/deduplicates captured detail; `delivery_counts` rebuilds fully.
+Candidates have routing key or JSON event type `order_delivered`; unrelated events stay in Bronze.
+
+Valid events require a UTF-8 JSON object, UUID event/order IDs, `order_delivered`, and an
+RFC 3339 occurrence timestamp with explicit timezone and at most six fractional digits.
+Higher timestamp precision is rejected rather than rounded across a window boundary.
+Bad candidates retain their original bytes and rejection reason in the input table.
+Identical bytes deduplicate by event ID, preserving the earliest receipt. Different bytes for
+the same parseable ID—including formatting changes and invalid variants—fail the upstream test.
+
+Use **`dbt build`, not `dbt run`**: the conflict test must pass before replacing counts.
+A failure leaves the previous count table stale and queryable; this prototype has no atomic
+multi-table publication gate. Inspect the command result before using its report. Additional
+fields stay in raw bytes; no lateness, unique-order or zone/algorithm metric is inferred.
+
+```sql
+SELECT window_start, delivered_events
+FROM lakehouse.analytics.delivery_counts
+ORDER BY window_start;
+
+SELECT rejection_reason, count(*)
+FROM lakehouse.analytics.stg_nomly__delivery_inputs
+WHERE rejection_reason IS NOT NULL
+GROUP BY 1;
+
+SELECT event_id, count(DISTINCT payload) AS variants
+FROM lakehouse.analytics.stg_nomly__delivery_inputs
+WHERE event_id IS NOT NULL
+GROUP BY 1 HAVING count(DISTINCT payload) > 1;
+```
+
+`dbt_project/analyses/chiara_delivery_counts.sql` provides a bounded report with `window_start`
+and `window_end` variables. Windows are half-open, based on UTC occurrence time; missing windows
+mean zero deliveries. Input capture uses incremental `append`, scanning only the **current and
+previous UTC ingestion-day partitions** by default, in both Bronze and captured inputs.
+`delivery_input_lookback_days` controls the number of days; `delivery_input_as_of_date` is the last
+included UTC day and defaults to the dbt run date. Bounds are inclusive midnight at the start and
+exclusive midnight after the last day. The input table is partitioned by `day(ingested_at)`.
+
+```bash
+just dbt '{"delivery_input_lookback_days":1}'  # Current UTC partition only.
+just dbt '{"delivery_input_as_of_date":"2026-01-01","delivery_input_lookback_days":7}'  # Historical backfill.
+```
+
+Capture excludes `(batch_id, UTC ingestion day)` pairs already present in the input table.
+The day is part of the checkpoint so one batch crossing midnight can be captured over two runs.
+Each consumer batch has a fresh ID and commits all its messages in one INSERT;
+**batch IDs must never be reused or extended later**. Capturing rows and their batch IDs is one
+Iceberg commit, so retries do not append the same batch again. New replay batches retain duplicate
+messages and rejected candidates; the detail view deduplicates valid event IDs and finds first receipts.
+Event time never filters discovery: an old delivery received today is included. Receipt dates outside
+the window are deferred until an explicit backfill or wider lookback. After a dbt outage longer than
+the window, backfill the missed dates before treating counts as complete. Replayed rows with their
+original old receipt timestamps need the same backfill. Timestamp maxima are not used as checkpoints.
+
+Within selected partitions, batches with no candidates may be rescanned because they have no captured
+rows. Conflict tests still scan accumulated inputs and counts still rebuild fully. Use one dbt writer.
+The existing input table is reused; delivery detail automatically converts back to a view if necessary.
+Temporary incremental relations use tables rather than views. Source corrections/deletions and
+validation/SQL changes require a full refresh with the complete intended raw history. First creation
+and full refresh intentionally read all retained history; window bounds apply only to incremental runs.
+Existing unpartitioned input tables need this one-time full refresh to rewrite their physical layout:
+
+```bash
+uv run --locked --project dbt_project dbt build --full-refresh --project-dir dbt_project --profiles-dir dbt_project
+```
+This counts unique delivery event IDs, not unique orders. The final Postgres sink is deferred.
+
+Connection overrides: `TRINO_HOST`, `TRINO_PORT`, `TRINO_USER`, `TRINO_CATALOG` (default `lakehouse`),
+`NOMLY_RAW_SCHEMA` (default `bronze`) and `NOMLY_ANALYTICS_SCHEMA` (default `analytics`).
+No dbt declarations control the all-events RabbitMQ consumer.
+
+```bash
+just dbt-test    # Existing models only; does not ingest or rebuild.
+just dbt-verify  # Build/test live models, then run the full isolated verification.
+```
+
+The full verification requires a running local Docker harness with some valid delivery events;
+its recipe builds live models first and the script checks that live data reconciles before creating fixtures.
+Verification creates disposable schemas, checks duplicates,
+replay, rejected payloads, delayed/boundary events, conflicts, stable input capture and invalid
+SQL/YAML/contracts, then independently reconciles the live captured bytes with staged rows and
+window counts. The fixture script does not stop ingestion or alter live models; avoid concurrent dbt builds.
+Evidence is written to `dbt_project/target/lakehouse_evidence.json` after cleanup succeeds.
+It also checks delivery detail's table-to-view migration, actual incremental INSERT execution,
+unchanged input files on no-op/failed-build retries, preservation of duplicates across replay batches,
+window bounds, explicit old backfills, midnight-spanning batches, earlier receipt corrections and
+full-refresh equivalence. Trino's query plan must show date constraints on both raw and input scans.
+
+`verify_<id>_raw/` and `verify_<id>_analytics/` are temporary object prefixes inside the
+single `nomly-lakehouse` bucket, not additional buckets. Dropping an Iceberg view leaves
+metadata objects behind, so verification drops its schemas and then deletes only its own
+exact prefixes. Cleanup verifies that no objects remain. An interrupted run can still leave
+artifacts; check that its catalog schemas are gone before removing that run's prefixes.
+Never delete `bronze/` or `analytics/` directly: those contain the live Iceberg tables.
 
 If something here doesn't work, tell us — that's our bug, not yours.

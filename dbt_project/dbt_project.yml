@@ -9,6 +9,13 @@ clean-targets: [target, logs]
 
 models:
   nomly:
+    +meta:
+      owner: dispatch
+      freshness_class: critical
+    +on_table_exists: rename
+    +properties:
+      format: "'PARQUET'"
+      format_version: "2"
     +persist_docs:
       relation: true
       columns: true
