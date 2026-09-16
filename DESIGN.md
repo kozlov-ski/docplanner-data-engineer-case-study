@@ -2,352 +2,442 @@
 
 ## 1. Executive Summary
 
-Retain immutable raw events; derive order facts and Dispatch metrics through one microbatch path. Analysts own dbt models; the platform owns ingestion and operation.
+Give analysts a shared dbt SQL/YAML monorepo for declaring datasets without writing consumers. Keep raw events for audit and replay; derive order facts and centrally defined metrics for Dispatch.
 
-### Key Decisions
+- **Storage and compute:** Lakehouse approach - Parquet in Iceberg tables on object storage; dbt Core runs SQL on Trino.
+- **One declarative codebase:** Scheduled batch, near-real-time microbatches and backfills reuse the same models, contracts and tests. Execution schedules and input ranges differ; business logic does not.
+- **Trade-off:** One transformation path reduces maintenance and batch/stream drift, but offers no continuous streaming or sub-minute latency. Iceberg adds maintenance overhead at today's scale.
+- **Serving:** Governed SQL access, a BI dashboard and alerts, plus a controlled Google Sheets export.
 
-- **Data model:** Raw events, order facts and metric tables in Parquet/Iceberg on object storage.
-- **Processing model:** dbt Core incremental models; latency-critical jobs every 2–5 minutes.
-- **Self-service interface:** SQL/YAML in a central dbt Core monorepo.
-- **Serving:** Trino-compatible SQL, BI dashboard and alerts; controlled Sheets export.
-- **Main trade-off:** Target 2–5 minute latency in exchange for one transformation path and lower complexity than separate batch/stream pipelines. Iceberg still adds operational overhead at today's scale.
+This is a proposed architecture. The five-minute freshness target needs benchmarking; the working slice in section 10 is not yet implemented.
 
 ## 2. Requirements and Assumptions
 
-### Users and Decisions
+### Users and Requirements
 
-| User | Need | Decision enabled |
-|---|---|---|
-| Chiara (Operations) | Detect late-delivery regressions by zone within minutes | Pause or continue the rollout |
-| Bea (Product) | Compare Dispatch v2 with the current algorithm | Adjust the rollout percentage |
-| Tomek (Analytics) | Query and extend datasets without a platform engineer | Perform and share ad hoc analysis |
-
-### Derived Requirements
-
-| Requirement | Evidence |
+| User | Required outcome |
 |---|---|
-| Self-service | Analysts should not need to write consumers |
-| Freshness | Problems must be visible “within minutes” |
-| Breakdown | Compare algorithms within each zone |
-| Event time | Offline-app flushes must not create false spikes |
-| Trust | Metrics inform production rollout decisions |
+| Chiara, Operations | Detect late-delivery regressions by zone within minutes to inform rollout decisions |
+| Bea, Product | Compare v1/v2 and use her Sheets template for presentation |
+| Tomek, Analytics | Declare events, fields and transformations without a platform ticket |
 
-### Assumptions
+The offline-app incident requires event-time aggregation. Rollout decisions require visible sample sizes, data-quality gaps and freshness; pipeline completion alone does not establish trust.
 
-- **Freshness:** Preliminary data visible within five minutes of broker receipt under normal operation; schedule, commit, transformation and dashboard refresh share this budget.
-- **Time:** Use UTC event time for metrics. Provisionally allow automatic corrections for **24 hours after window end**; older changes require backfill. This cutoff limits routine work, not uncertainty about completeness.
-- **Metric:** Delivery takes over 45 minutes from placement to delivery. Exclude cancellations; report incomplete orders separately. Product and Operations approve the final definition.
-- **Scale and retention:** A few hundred orders/minute today; evaluate at 100x. Provisionally retain raw data for 90 days, subject to replay needs and privacy policy.
+### Provisional Assumptions
 
-### Open Questions
+- **Freshness:** Publish validated results within five minutes of broker receipt under normal operation. Critical jobs start every two minutes; ingestion, scheduling, computation and checks share the budget. Trigger dashboard refresh on publication. Pending corrections do not count as refreshed results; source outages remain a separate visibility gap.
+- **Time:** UTC event time; automatic metric corrections for 24 hours after window end. Older arrivals require explicit backfill. Expiry does not establish completeness.
+- **Metric:** Placement-to-delivery duration strictly greater than 45 minutes; exclude cancellations and report incomplete orders separately.
+- **Scale and retention:** A few hundred orders/minute today; assess 100x. Retain raw data for 90 days provisionally, subject to privacy and replay needs.
 
-| Question | Owner | Effect on the design |
-|---|---|---|
-| Late definition, comparison window, minimum sample and alert threshold? | Product and Operations | Metric and rollout decisions |
-| Is five-minute freshness sufficient; how late can corrections arrive? | Operations | Schedule and correction window |
-| Authoritative reconciliation source and dimension history? | Analytics and source owners | Completeness and historical zone attribution |
-| Courier access, retention and availability target? | Security and domain owner | Permissions, lifecycle and recovery budget |
+### Questions Before Production
+
+| Question | Owner |
+|---|---|
+| Late definition, comparison window, minimum sample and alert threshold? | Product and Operations |
+| Is five-minute freshness sufficient, and how late must automatic corrections remain possible? | Operations |
+| Authoritative reconciliation source and historical restaurant/zone mappings? | Analytics and source owners |
+| Courier access, retention and availability target? | Security and domain owner |
 
 ## 3. Architecture
 
+### Flow and Storage
+
 ```mermaid
 flowchart LR
-    A[Producers] --> B[Event broker]
-    B --> C[Validated ingestion]
-    C --> D[Iceberg raw events]
-    C --> Q[Quarantine]
-    D --> E[dbt incremental models]
-    E --> F[Order facts]
-    R[Restaurant and zone snapshots] --> F
-    F --> M[Dispatch metrics]
-    F --> T[Trino]
-    M --> T
-    T --> H[Dashboard and alerts]
-    T --> S[Controlled Sheet export]
+    B[Event broker] --> R["Bronze<br/>Raw events and DB snapshots"]
+    D["Operational DBs<br/>Restaurants, zones, couriers"] -->|Scheduled extraction| R
+    R --> S["Silver<br/>Events, dimensions and order facts"]
+    S --> G["Gold<br/>Published metrics"]
+    G --> C["SQL, BI and alerts<br/>Sheets export"]
 ```
 
-### Data Flow
+Raw events, database snapshots and derived tables use the same storage layer. A REST-compatible Iceberg catalog locates table metadata and coordinates commits. Quarantine stores rejected bytes and reasons separately on object storage.
 
-1. **Ingestion:** Consume registered inputs; acknowledge only after durable raw/quarantine commit. Retries may append duplicates.
-2. **Validation and quarantine:** Check envelope and event contract; retain invalid bytes and reason outside curated inputs.
-3. **Raw storage:** Preserve payload, `event_id`, event time, ingestion time and source position where available.
-4. **Transformation:** Read newly committed raw batches to identify affected orders regardless of event age; filtering new input by event time alone would miss late facts. Deduplicate, merge lifecycle state and recompute affected metric windows within the correction horizon. Advance checkpoints only after success; flag expired windows for backfill.
-5. **Serving:** Publish the last successful metric build and its input cutoff. Copy restaurant/zone dimensions on a provisional daily schedule; historical attribution needs versioned mappings.
-
-### Technology Choices
-
-| Layer | Choice | Why | Cost or limitation |
-|---|---|---|---|
-| Broker | Existing broker; Kafka-compatible log if production needs replay | Avoid unnecessary migration | Retention and throughput need sizing |
-| Raw storage | Object storage, Parquet, Apache Iceberg | Compressed columns and auditable history | Small files and maintenance |
-| Catalog | Iceberg REST-compatible catalog | Shared table discovery | Catalog availability and access integration |
-| Transformation | dbt Core incremental models on Trino | One SQL path for live data and backfill | Adapter compatibility and MERGE cost |
-| Curated storage | Iceberg order facts and aggregates | Reusable, correctable tables | Updates rewrite data or add delete files |
-| Query engine | Trino | Iceberg reads and writes | Compute and concurrency management |
-| Serving | BI dashboard and alerts | Governed metrics | BI refresh consumes freshness budget |
-
-Validate compatibility between dbt, Trino and the chosen catalog before deployment.
-
-### Data Model
-
-| Model | Grain | Purpose | Update pattern |
-|---|---|---|---|
-| `raw_order_events` | One immutable row per received event; duplicates retained | Audit and replay | Append |
-| `fct_orders` | One row per order | Lifecycle, zone and algorithm | Merge affected orders |
-| `dispatch_metrics` | Event-time window × zone × algorithm | Rollout monitoring | Replace affected aggregates |
-
-Partition raw by ingestion day, facts by placement day and metrics by window-start day. Use [Iceberg hidden partitioning](https://iceberg.apache.org/docs/latest/partitioning/), not exposed Hive paths; avoid minute-level or high-cardinality partitions. Compact small files from frequent commits.
-
-### Event Timestamps
-
-- **`occurred_at`:** Source-reported business-event time; placement and delivery timestamps determine duration, and delivery time determines the metric window. Preserve it through retries and replay.
-- **`ingested_at`:** Platform receipt time for each raw arrival. Its difference from `occurred_at` measures observed arrival delay, subject to source-clock accuracy. Processing/publication time describes pipeline freshness, not when the delivery happened.
-- **Clock quality:** UTC standardizes representation; it does not repair inaccurate device clocks. Quarantine invalid timestamps and flag suspect lifecycle timing; never silently substitute ingestion time for event time.
+| Component | Decision and trade-off |
+|---|---|
+| Broker | Keep the existing broker; consider a replayable log only if retention or throughput requires it |
+| Iceberg / Parquet | Portable storage, atomic table commits, snapshots/time travel, schema evolution and hidden/evolving partitions; requires maintenance |
+| Trino + dbt Core | Shared SQL transformations and query access; incremental merges and adapter compatibility need validation |
+| Orchestrator | Required for schedules, dependencies, retries and publication; prefer an existing scheduler, vendor unspecified |
 
 
-### Event-Level and Order-Level Data
+**Why a lakehouse:** Open storage, ACID-compliance, replayable history and engine portability motivate this provisional choice. Portability is an assumed platform priority, not a requirement established by the brief. An existing managed warehouse may be simpler at today's scale; prefer it if portability does not justify operating Trino, a catalog and table maintenance. Neither lower cost nor the freshness target is established without benchmarks.
 
-- **Decision:** Keep raw evidence and reusable derived tables.
-- **Benefits:** Analysts avoid rebuilding lifecycles; raw data supports new questions and corrections.
-- **Costs:** Extra storage, deduplication and mutable fact maintenance.
-- **Replay and reprocessing:** Pin raw snapshots, dimension versions and SQL revision; rebuild affected ranges with the same models.
-- **Alternatives rejected:** Raw-only repeats complex queries; fact-only loses evidence and replay flexibility.
+### Medallion Quality Contracts
+
+| Layer | Existing data and quality guarantee |
+|---|---|
+| Bronze (replay safety net) | `raw_order_events` preserves accepted payloads and receipt metadata; DB snapshots preserve source rows and extraction metadata. Quarantine retains rejected bytes and reasons separately. Replayable within retention limits; duplicates and business-invalid events may remain |
+| Silver (validated detail) | Staging events, dimension versions and `fct_orders`: enforce types, schema and required-field/null rules; deduplicate event IDs and quarantine conflicts. Missing lifecycle events or attribution remain explicit quality flags, not silently dropped orders |
+| Gold (stakeholder outputs) | `dispatch_metrics` pre-aggregates by window, zone and algorithm. Publish only after tests and reconciliation, with definition version, freshness and quality indicators; failed candidates leave the prior version visible as stale |
+
+Medallion defines progressively stronger quality contracts; dimensional modelling defines business grain and relationships. The approaches complement each other. A layer name alone does not guarantee correctness or completeness.
+
+### Ingestion and Transformation
+
+```mermaid
+flowchart LR
+    B[Event broker] --> V{Validate payload}
+    V -->|Valid| R[Raw storage]
+    V -->|Invalid| Q["Quarantine<br/>Bytes and reason"]
+    R -->|Durable commit| A[Acknowledge broker]
+    Q -->|Durable commit| A
+```
+
+Acknowledge only after durable storage; retries may create raw duplicates. Raw retains payload, event ID, event time, ingestion time and source position where available.
+
+- **Validation:** Registered, versioned JSON Schema per event type, using a validator such as [jsonschema](https://python-jsonschema.readthedocs.io/en/stable/validate/). Check required fields, types and timestamp formats; enable format checking explicitly. Preserve compatible additive fields.
+- **Transformation:** Apply the timestamp and correction rules below; advance committed-batch checkpoints only after success. Publication checks are in section 6.
+- **Dimensions:** Build validated dimensions from Bronze DB snapshots. Include changed mappings in affected-order selection; missing history remains a quality gap.
+
+### Timestamps and Late-Arriving Facts
+
+| Clock | Meaning and use |
+|---|---|
+| Event time (`occurred_at`) | Source-reported occurrence; lifecycle durations and business windows |
+| Ingestion time (`ingested_at`) | Ingestion-service receipt; raw ingestion-day partitioning |
+| Processing / publication time | When computation runs / validated results become visible; operational latency |
+
+Offline buffering can change an already published window.
+
+**Late arrival is distinct from a delivery taking >45 minutes.** A delivery at 23:50 received at 01:00 the next day belongs to the previous day's delivery window but the new day's raw partition. Measure freshness from broker receipt; `ingested_at` alone excludes queue backlog.
+
+- **Discover:** Read newly committed raw batches regardless of event age; deduplicate by event ID and update affected orders. Timestamps alone are not processing checkpoints.
+- **Correct:** Recompute affected windows within 24 hours after window end, provisionally. Replace prior contributions, including old and new groups when attribution changes. Retain older arrivals for explicit backfill; show pending corrections and quality gaps.
+- **Replay:** Preserve event timestamps and original receipt metadata. Fix the run’s `as_of` when reproducing overdue-order calculations; execution time must not move business windows.
+
+Normalize to UTC, quarantine invalid timestamps and flag suspect timing; never silently substitute ingestion time. Arrival delay (`ingested_at - occurred_at`) depends on source-clock accuracy.
+
+### Operational Databases into Bronze
+
+Events contain entity IDs; restaurant-to-zone mappings and courier attributes come from operational databases. Platform owns extraction; dbt transforms the landed data.
+
+| Method | Decision and limits |
+|---|---|
+| Scheduled full snapshots | Default for these small, slow-moving tables: initial load, then daily provisionally. Simple, but misses intermediate changes and adds source scan load |
+| Incremental polling | Consider for larger tables with reliable update markers and explicit deletion tracking. The harness has neither; polling can miss intermediate versions |
+| Log-based CDC | Use an initial snapshot followed by inserts, updates and deletes when fresher dimensions or change history are required. Adds connector, checkpoint and source-log retention operations|
+| Version-controlled seeds | Only for small, static reference mappings or test fixtures. [dbt seeds](https://docs.getdbt.com/docs/build/seeds) are not ongoing replication of operational tables; seeding the harness only initializes its source DB |
+
+Store each consistent source snapshot with source/table, extraction time and batch ID; expose only completed batches. Compare complete snapshots by primary key to detect observed changes and deletions. Daily refresh assumes up to one day of dimension staleness is acceptable; show its freshness separately from event freshness and confirm with Operations.
+
+Snapshot history records when a value was observed, not its exact business-effective time. CDC preserves captured database changes, but cannot recover earlier history or establish business-effective dates by itself. Exact historical zone attribution requires source-provided effective dates or an explicitly accepted approximation.
+
+### Storage Decision
+
+Keep append-only `raw_order_events` plus derived order and metric tables. Raw-only storage repeats lifecycle logic in every query; order-only storage loses replay evidence. Keeping both costs extra storage and mutable-table maintenance.
+
+Partition raw by **ingestion day**, orders by placement day and metrics by window-start day. Keep missing-placement orders in an explicit unknown partition until corrected. Avoid minute-level or high-cardinality partitions. Pin raw snapshots, dimension versions and SQL revision for reproducible reprocessing; maintenance must protect those inputs.
 
 ## 4. Self-Service Interface
 
-### Analyst Experience
+### Analyst Workflow
 
-1. Reference registered staging models; choose events and fields in SQL.
-2. Add dbt YAML with owner, description, contract, tests and freshness class.
-3. Open a PR; CI parses, compiles and builds changed models plus downstream dependencies in an isolated schema.
-4. Domain owners approve semantics; platform review applies only to shared layers or policy changes.
-5. Merge deploys the selected models and publishes dbt documentation.
+```mermaid
+flowchart LR
+    A[SQL and YAML PR] --> B["CI checks<br/>Isolated build"]
+    B -->|Pass| C["Owner approval<br/>and merge"]
+    C --> D["Deploy revision<br/>Refresh docs"]
+```
 
-### Declarative Interface
+- **Declare:** Select registered inputs and write SQL with model settings in `config()`. Use supporting YAML for source declarations, column definitions, tests and downstream exposures.
+- **Check and approve:** CI validates the change and affected downstream models in an isolated schema. Domain owners approve semantics; Platform reviews shared layers, new inputs and policy changes. The orchestrator deploys the approved revision.
 
-Analysts use standard dbt SQL and YAML to declare inputs, transformations, output contracts, tests, ownership and freshness class. Registered staging models provide validated, deduplicated events. The platform schedules and deploys the models; no custom configuration language or UI is needed.
+Platform registers each source once; Tomek reuses its validated, deduplicated input without writing a consumer.
 
-### Pull Request Validation
+### What Tomek Submits
 
-| Check | Failure caught |
+**Proposed example, not yet implemented.** The Postgres slice combines validation and deduplication in `raw.deliveries`; production keeps separate raw and staging layers.
+
+**1. Tomek's checklist**
+
+- [ ] Select a registered input.
+- [ ] Write the SQL model; set its owner and freshness class.
+- [ ] Declare output columns and tests.
+- [ ] Register dashboard and Sheets dependencies as exposures.
+- [ ] Open a PR; fix validation failures before owner approval.
+
+**2. SQL model and configuration**
+
+Model settings live next to the query. This example uses Postgres 16's `date_bin`; Trino needs its equivalent time-bucketing expression.
+
+```sql
+-- models/dispatch/delivery_counts.sql
+{{ config(
+    materialized='table',
+    contract={'enforced': true},
+    meta={
+        'owner': 'dispatch',
+        'freshness_class': 'critical'
+    }
+) }}
+
+-- Full rebuild for the small Postgres interview slice.
+select
+    date_bin(
+        interval '5 minutes',
+        occurred_at,
+        timestamptz '2000-01-01 00:00:00+00'
+    ) as window_start,
+    count(*) as delivered_events
+from {{ source('nomly', 'deliveries') }}
+group by 1
+```
+
+**3. Supporting YAML and exposures**
+
+Keep source declarations, column definitions and tests in YAML. [Exposures](https://docs.getdbt.com/docs/build/exposures) also belong here, rather than in SQL `config()`: they record downstream dependencies, but do not create dashboards or export Sheets.
+
+```yaml
+# models/dispatch/delivery_counts.yml
+version: 2
+
+# Registered once by Platform; reused by Tomek.
+sources:
+  - name: nomly
+    schema: raw
+    tables:
+      - name: deliveries
+        config:
+          meta:
+            event_type: order_delivered
+
+models:
+  - name: delivery_counts
+    description: Delivery event counts by occurrence time.
+    columns:
+      - name: window_start
+        data_type: timestamp with time zone
+        data_tests: [not_null, unique]
+      - name: delivered_events
+        data_type: bigint
+        data_tests: [not_null]
+
+# Consumers of this example model.
+exposures:
+  - name: dispatch_dashboard
+    type: dashboard
+    owner:
+      name: Chiara
+    depends_on:
+      - ref('delivery_counts')
+
+  - name: dispatch_sheets
+    type: application
+    owner:
+      name: Bea
+    depends_on:
+      - ref('delivery_counts')
+```
+
+**4. What happens after submission**
+
+| Step | Platform behaviour |
 |---|---|
-| YAML, ownership and policy validation | Invalid config, missing owner or unauthorized exposure |
-| dbt parse/compile and isolated build | Broken references, SQL errors and contract mismatch |
-| Duplicate, out-of-order and late-event fixtures | Counting and correction regressions |
-| Domain tests and incremental-versus-full comparison | Invalid lifecycle or divergent replay results |
-| Deployment preview | Unexpected dependencies, scans or schedule changes |
+| Validate | Reject missing owner, unsupported freshness class, invalid SQL or failed tests before production |
+| Ingest | Reuse the registered event subscription; validate and deduplicate input into `raw.deliveries` |
+| Schedule | Map `critical` to a two-minute schedule |
+| Publish | Release validated results; use exposures to identify affected consumers and owners |
 
-### Deployment Lifecycle
+The shared consumer maps the source's `event_type` to a dedicated durable queue on `nomly.events`. dbt [`meta`](https://docs.getdbt.com/reference/resource-configs/meta) stores these declarations; Platform implements the consumer and scheduling behaviour.
 
-Repository ownership rules route approval. Automated checks use restricted credentials and representative test data. Merge runs the validated revision; failed builds retain the last successful dashboard publication. Rollback restores the previous revision and rebuilds affected outputs. New event sources require platform registration once, not a consumer per analyst.
+This Postgres example counts **delivery events**. Calculating lateness also requires placement and assignment events; the harness supplies `algo_version` only on assignment.
 
-### AI Reviewer
+### PR Validation
 
-| Appropriate use | Not trusted for |
+| Check | What it catches |
 |---|---|
-| Explain failures; suggest edge cases | Semantic approval |
-| Flag suspicious SQL and summarize changes | Access authorization |
-| Suggest tests | Replacing deterministic checks or approving deployment alone |
+| SQLFluff, YAML linting and shared contribution checks | Formatting, naming, layout and missing metadata |
+| Contract and policy checks | Invalid configuration, missing owner or unauthorized exposure |
+| dbt parse/compile and isolated build | Broken references, SQL errors and output-contract mismatch |
+| Domain fixtures and data tests | Duplicates, malformed/late/out-of-order inputs and invalid lifecycle states |
+| Incremental-versus-full comparison and deployment preview | Replay divergence, unexpected dependencies, scans or schedules |
+
+Use the same pinned tools locally and in CI, with restricted credentials and representative data. JSON Schema validates incoming payloads; dbt model contracts validate output structure; data tests validate business rules. None replaces the others.
+
+**State-aware CI:** Retain the manifest from the last successful production deployment separately from CI output. Each PR builds and tests new/modified models and downstream dependants in an isolated schema (`state:modified+`), using read-only production references for unchanged upstream models (`--defer`). This reduces rebuild work and analyst feedback time as teams join. Policy checks and correctness fixtures remain mandatory; scheduled refreshes process new data independently of code-state selection.
+
+**How AI can help:** AI can explain failures, suggest tests and flag suspicious SQL. It cannot approve semantics, authorize access or replace deterministic checks. Rollback restores the previous code revision and rebuilds affected outputs before publication.
 
 ## 5. Dispatch Data Product
 
-### Metric Definition
+### Metric and Models
 
-- **Definition of late delivery:** Late delivered orders / eligible delivered orders; late means duration >45 minutes.
-- **Start and end events:** Placement to delivery; provisionally group by five-minute delivery-time windows. Zone comes from placement's restaurant; algorithm from assignment.
-- **Cancellations:** Exclude from numerator and denominator; show separately.
-- **Incomplete orders:** Show open, overdue (>45 minutes) and missing-event counts alongside delivery rate to expose survivor bias.
-- **Late-arriving facts:** Delayed placement or assignment can change duration, eligibility or algorithm attribution, revising historical counts and late rates. Recompute affected aggregates, including previous groups when attribution changes, under the correction policy. Missing placement/assignment remains an explicit quality gap.
-- **Metric owner:** Dispatch Product and Operations; Analytics maintains the SQL.
+**Metrics are centrally defined in dbt models, with documentation and tests.** Dispatch Product and Operations own semantics; Analytics maintains SQL. BI and Sheets consume published outputs. Aggregate rates from summed numerators and denominators, never by averaging percentages.
 
-**Example (UTC):** An order placed at 12:00 and delivered at 12:50 has its delivery event arrive at 14:00 after an offline period. Its duration is 50 minutes, so it contributes to delivered and late counts in the 12:50–12:55 window. The arrival creates no 14:00 delivery spike and adds no offline delay to the duration. Until received, that delivery is absent from the rate and the order appears incomplete.
+> **Late-delivery rate = late eligible deliveries / all eligible deliveries.**
+> 
+> Eligible orders have delivery, placement, assignment and zone attribution, valid timing, and no cancellation. Late means delivery minus placement **>45 minutes**; an empty denominator yields no rate.
+> 
+> Group by five-minute delivery-time window, zone and algorithm. Zone follows the placement restaurant's historical mapping; algorithm comes from assignment. Show cancellations, open orders, overdue open orders (>45 minutes) and missing-input counts separately. Open-order counts are a current-state view, not deliveries in a historical window. Evaluate overdue status at each run's fixed as-of time, even without new events.
 
-### Dispatch Models
+| Model | Grain and content |
+|---|---|
+| `fct_orders` | One row per order: lifecycle times, zone, algorithm, status, duration and quality flags |
+| `dispatch_metrics` | Five-minute window × zone × algorithm: delivered/late counts, rate, definition version, input cutoff and correction status |
 
-| Model | Grain | Important fields |
-|---|---|---|
-| `fct_orders` | Order | Placement/delivery times, zone, algorithm, duration, status, quality flags |
-| `dispatch_metrics` | Five-minute window × zone × algorithm | Delivered/late counts, late rate, metric version, input cutoff, completeness |
+### Rollout Guardrails
 
-### Serving
+**Illustrative example, not observed results:** compare two groups of 100 orders from the same zone and placement cohort, at the same as-of time.
 
-- **Dashboard:** Compare v1/v2 by zone, with sample counts and incomplete-order indicators; descriptive differences alone do not establish causality.
-- **Refresh interval:** Refresh after successful critical builds, within the five-minute budget.
-- **Dimensions and drill-down:** Zone and algorithm; authorized users can inspect affected orders in Trino.
-- **Alerts:** Notify Operations on agreed regression thresholds and minimum sample sizes; suppress rollout conclusions when data is stale or incomplete.
+| Measure | v1 | v2 |
+|---|---:|---:|
+| Completed deliveries | 100 | 60 |
+| Late completed deliveries | 10 | 3 |
+| Completed-delivery late rate | 10% | 5% |
+| Open orders already older than 45 minutes | 0 | 40 |
 
-### Google Sheets Decision
+v2 looks better on the completed-delivery rate while 40 orders remain overdue. Show and alert on both lateness and overdue open orders; missing attribution can also invalidate the comparison.
 
-- **Decision:** Offer Bea's template a bounded aggregate export from the same metric table.
-- **Role of a sheet, if any:** Sharing and presentation, with metric version and data timestamp.
-- **Why it is or is not the system of record:** Editable cells and independent formulas cannot govern operational metrics.
-- **Volume and correctness limitations:** Cap rows, replace the export range and show failed refreshes; keep alerts in BI.
+**Provisional decision window:** compare a rolling 60 minutes within each Warsaw zone, requiring at least 100 eligible deliveries per algorithm per zone before a rate-based conclusion. This is a discussion default, not proof of statistical significance; the example's v2 group is below it. Show **insufficient evidence** or **degraded data** explicitly. Bea and Chiara approve thresholds and rollout actions before expansion.
+
+### Serving and Google Sheets
+
+- **Dashboard:** Compare v1/v2 by zone with counts, quality indicators, definition version and input cutoff. Refresh after validated publication, with a five-minute fallback refresh. Differences alone do not prove causality.
+- **Alerts:** Apply the guardrails above; degraded data alerts the responsible owner even when business conclusions are suppressed. Authorized users can investigate orders through Trino.
+- **Sheets:** Populate Bea's template with a bounded aggregate export from the same published version. Replace only the managed range, include its version/timestamp and surface refresh failures. Sheets is editable presentation, not the system of record; keep operational alerts in BI.
 
 ## 6. Correctness and Trust
 
+**Transformation idempotency:** Identical inputs, model revision and as-of time must produce unchanged business results on rerun. Use stable keys and deterministic merges or replacement of affected aggregates; retries must not double-count.
+
 ### Failure Handling
 
-| Failure mode | Handling | User-visible guarantee |
-|---|---|---|
-| Duplicate event | Deduplicate by `event_id`; quarantine conflicting payloads for the same ID | One contribution per valid event |
-| Out-of-order event | Reconstruct affected lifecycle by event time, with deterministic tie-breaking | Arrival order does not define lifecycle |
-| Offline-app burst | Aggregate by delivery `occurred_at`; apply correction/backfill policy | Revise historical windows, no ingestion-time delivery spike |
-| Malformed payload | Preserve original bytes and reason in quarantine | Auditable rejection; valid inputs continue |
-| Missing terminal event | Retain explicit incomplete state | Orders do not silently disappear |
-| Replay or backfill | Deterministic models, stable IDs and idempotent merges | No duplicate curated contributions |
+| Failure | Handling |
+|---|---|
+| Duplicate event | Deduplicate by `event_id`; quarantine conflicting payloads and block affected publication pending resolution |
+| Out-of-order events | Reconstruct lifecycle by event time with stable event-ID tie-breaking |
+| Offline-app burst | Correct delivery-time windows, never arrival-time delivery counts |
+| Malformed payload | Retain bytes and reason in quarantine; valid ingestion continues |
+| Missing terminal event | Keep explicit incomplete state and visible overdue counts |
+| Replay/backfill | Use stable IDs, pinned inputs and idempotent merges; compare against a full rebuild of the same retained range |
 
-### Guarantees and Non-Guarantees
+### Publication Guarantees and Limits
 
-| Area | Guarantee | Explicit limitation |
-|---|---|---|
-| Freshness | Preliminary results within five minutes under normal operation | Cannot include events still offline at source |
-| Completeness | Missing inputs and incomplete orders remain visible | No exactly-once delivery or proof of unobserved events |
-| Late-data correction | Automatically revise affected windows for 24 hours after window end, provisionally; retain older arrivals and flag affected windows for backfill | Results remain provisional; expiry does not prove completeness, and older corrections require explicit backfill |
-| Availability | Atomic table updates; retain last successful publication | Availability target unagreed; stale data is labelled |
+**Table guarantees:** Iceberg provides atomic commits and consistent snapshots per table; business correctness still requires pipeline checks. These guarantees depend on compatible writers, catalog and storage. Multi-table dbt runs and broker acknowledgements are not one atomic transaction.
 
-[Iceberg snapshots](https://iceberg.apache.org/docs/latest/reliability/) prevent partial **table** updates, not partial multi-table dbt runs. Publish dashboard results only after required builds/tests succeed; expose pending historical backfills in the correction status.
+```mermaid
+flowchart LR
+    C["Candidate metrics<br/>and quality indicators"] --> T{"Tests and<br/>reconciliation"}
+    T -->|Pass| P[Switch published version]
+    T -->|Fail| K["Keep previous version<br/>Flag stale and alert"]
+    P --> R["Refresh BI<br/>Export Sheets"]
+```
+
+**Write-audit-publish (WAP):** Switch one publication pointer to the validated table versions after the checks above. BI and Sheets consume that fixed version; failed checks leave the prior version visible as stale and alert owners.
+
+**Limits:** Five-minute freshness is an unverified target; availability remains to be agreed. No exactly-once broker delivery or completeness guarantee for offline or unobserved events.
 
 ### Proving the Number
 
-- **Reconciliation source:** Request authoritative order-system counts; event-pipeline agreement alone cannot prove producer completeness.
-- **Input-volume check:** Reconcile broker positions/batches with durable raw plus quarantine, accounting for retries. Compare unique valid raw IDs with curated IDs; delivery counts are not unique-event counts.
-- **Lifecycle invariants:** Unique IDs, nonnegative durations, valid lifecycle ordering, late ≤ delivered, explicit missing zone/algorithm counts.
-- **Comparison with the existing daily report:** Align definition, window and dimensions; investigate differences rather than assuming the report is correct.
-- **Check that fails loudly:** Any unexplained reconciliation difference or failed invariant blocks publication and alerts the owner.
-- **Evidence shown to Chiara:** Numerator, denominator, metric version, data timestamp and completeness/correction status.
+- Reconcile authoritative order-system counts with platform results; pipeline agreement alone cannot prove producer completeness.
+- Reconcile recorded input batches/positions, where available, against durable raw plus quarantine, accounting for retries. Compare unique valid raw IDs with curated IDs; event counts are not order counts.
+- Test uniqueness, valid lifecycle ordering, nonnegative durations, late ≤ delivered and explicit missing-attribution counts.
+- Compare the daily report after aligning definitions, windows and dimensions; investigate rather than assuming it is correct.
+- Block affected publication and alert owners on critical invariants or unexplained reconciliation differences. Show Chiara numerator, denominator, freshness, quality gaps and pending corrections.
 
 ## 7. Platform Ownership and Onboarding
 
-### Ownership Boundaries
-
-| Platform team owns | Product team owns |
+| Platform owns | Product teams own |
 |---|---|
-| Ingestion, staging, runtime and shared macros | Domain marts and metric semantics |
-| Shared contracts, reliability and permissions | Domain tests and acceptance criteria |
-| Catalog, deployment and incident tooling | Documentation and domain-quality response |
+| Ingestion, staging, runtime, catalog and shared macros | Domain models and metric semantics |
+| Contract framework, permissions and reliability | Domain contracts, tests and acceptance criteria |
+| Deployment, maintenance and incident tooling | Documentation and domain-quality response |
 
-Repository ownership: platform owns staging; intermediate models have shared ownership; Dispatch and Payments own their respective marts. Required reviewers follow these boundaries.
+Repository ownership routes reviewers; shared intermediate models require named owners. To onboard teams 2–10: register the owner and access policy, reuse supported inputs/templates, add SQL/YAML and tests, pass the same PR checks, then publish documentation and alert ownership.
 
-### Onboarding Teams 2-10
-
-1. Register domain owner and access policy.
-2. Reuse a supported dbt model template and registered inputs.
-3. Add domain SQL, contracts and tests.
-4. Validate and deploy through the same PR path.
-5. Publish documentation, freshness class and alert ownership.
-
-### Preventing Bespoke Pipelines
-
-- **Standard interfaces:** Shared staging contracts and dbt SQL/YAML.
-- **Supported extension points:** Domain models and tests; reviewed shared macros for dialect differences.
-- **Criteria for changing the platform:** A demonstrated shared need; federate dbt projects only when CI or release contention is measurable.
-- **Deprecation policy:** Version breaking interfaces, identify dependants and agree migration before removal.
+Extend through domain models and reviewed shared macros. Add platform features only for demonstrated shared needs. Version breaking interfaces and agree consumer migration before removal; split projects only when measured CI or release contention warrants it.
 
 ## 8. Operations, Schema Evolution, and Security
 
-### Observability
+### Orchestration and Monitoring
 
-Thresholds below are provisional operating rules.
+The **data orchestrator** schedules critical dbt jobs every two minutes, slower batch models, daily dimension refreshes, validation/publication, Sheets exports, backfills and maintenance. Enforce dependencies, bounded retries and non-overlapping writes to the same outputs. Route failures to named owners; export failure must not invalidate an already validated metric publication.
 
-| Signal | Threshold | Response |
-|---|---|---|
-| Queue lag | Endangers five-minute budget | Platform investigates consumer/commit backlog |
-| Data freshness and arrival delay | Publication >5 minutes old; source delay exceeds correction window | Mark stale; distinguish pipeline delay from offline sources |
-| Invalid-event rate | Any rejected events initially | Notify source owner; tune alert after baseline |
-| Transformation failures | Any critical build failure | Retain prior publication; retry or roll back |
-| Reconciliation failures | Any unexplained difference | Block publication; investigate with domain owner |
+Monitor backlog, arrival delay, processing duration, rejected events, failed tests, publication freshness, export status and compute/storage cost. Alert Platform on freshness breaches and runtime failures; send domain-quality failures to product owners. Link incidents to logs, input versions and code revisions. Keep monitoring available when processing fails.
 
-### Schema Evolution
+### Failure Isolation
 
-- **Additive fields:** Preserve in raw; expose deliberately through staging and domain PRs.
-- **Breaking changes:** Version contracts and migrate consumers; quarantine incompatible payloads.
-- **Compatibility validation:** CI builds downstream dependants against changed schemas.
-- **Backfill behavior:** Reprocess selected retained history; never invent fields absent from old payloads.
+**Another team's bad model or backfill can delay Dispatch on shared infrastructure.** Bound the impact at three levels:
 
-### Access Control
+- **Dependencies:** Schedule each product's dependency graph independently, e.g. `dbt build --select "+exposure:dispatch_dashboard"`, with its own publication gate. An unrelated model execution failure must not gate Dispatch; a failed shared upstream dependency must. Exposures/tags enable selection, not runtime isolation. Project-wide parsing can still fail on unrelated malformed definitions, so production runs a pinned, CI-validated revision.
+- **Writes and scheduling:** Restrict domain jobs to owned outputs. Coordinate shared upstream builds once per required refresh; reuse those results across consumer jobs. Bound backfill concurrency and retries, and serialize live/backfill writes to the same tables. Exposure selection alone does not coordinate overlapping jobs or override slower dimension schedules.
+- **Compute:** Use separate [Trino resource groups](https://trino.io/docs/current/admin/resource-groups.html) for critical Dispatch jobs, other teams and backfills, with priority and concurrency limits plus query memory/runtime limits. Monitor queue wait and publication freshness; throttle or pause backfills when the freshness budget is threatened. Resource groups share workers and do not isolate cluster outages. Move critical workloads to separate compute if measured contention breaches the target; catalog, storage and shared-input failures remain common dependencies.
 
-- **Model:** Domain roles and least-privilege service accounts; restricted raw/quarantine access.
-- **Treatment of `courier_id`:** Restricted identifier; omit from default metrics and grant detailed access only for approved purposes.
-- **Auditability:** Record access, model revisions, deployments and exports. “Immutable” means append-only processing within approved retention/deletion policy.
+### Iceberg Maintenance
+
+Schedule and monitor [Trino maintenance operations](https://trino.io/docs/current/connector/iceberg.html#alter-table-execute): compact small files (`optimize`), optimize manifests, expire snapshots and remove orphan files. Use retention safeguards that exceed in-flight write/retry durations; protect snapshots used by active readers and replays.
+
+Raw-data retention and snapshot retention are separate policies. Expiring snapshots does not delete rows still present in the current table. Apply approved row retention, then reclaim obsolete files safely; retain pinned versions for the agreed reproducibility window.
+
+### Schema Evolution and Security
+
+- **Evolution:** Preserve compatible new fields in raw; expose through reviewed staging/domain changes. Version breaking contracts and test downstream consumers. Backfills cannot invent fields missing from historical payloads.
+- **Access:** Domain roles and least-privilege service accounts; restrict raw/quarantine and direct catalog/storage access to prevent bypassing Trino permissions. Omit `courier_id` from default metrics; grant detailed access only for approved purposes.
+- **Audit and lifecycle:** Record access, exports, permissions, deployments and model revisions. Apply deletion/retention policies to current tables, snapshots, quarantine and controlled exports. “Append-only” describes processing within those policies.
 
 ## 9. Scale and Cost
 
-### Current Scale
+**Sizing assumptions, not measurements:** 300 orders/minute, 5 events/order and 1 KB/event (decimal), before compression, retries and derived data. Actual lifecycle counts vary.
 
-- **Throughput:** Illustratively, 300 orders/minute × 5 events ≈1,500 events/minute; at 100x ≈150,000. Actual lifecycle counts vary.
-- **Freshness:** Run only the critical dbt selector every 2–5 minutes; measure the entire publication path.
-- **Storage profile:** At an assumed 1 KB/event, ≈2.2 GB/day today or 216 GB/day at 100x before compression, retries and derived tables.
-- **Compute profile:** Trino transforms and queries; compaction adds work. No defensible price estimate until compression, scans and concurrency are measured; benchmark cost per million events and dashboard query.
+| Measure | Today | 100× |
+|---|---:|---:|
+| Events/second | 25 | 2,500 |
+| Events per two-minute batch | 3,000 | 300,000 |
+| Raw data/day | 2.16 GB | 216 GB |
+| Raw data retained for 90 days | 194.4 GB | 19.44 TB |
 
-### At 100x Scale
+At an **illustrative $0.025 per decimal GB-month**, retained raw storage costs approximately **$5/$486 per month**, before compression, extra copies and other charges. Each **$1/hour** of continuously running compute adds approximately **$730/month**. These are cost-model inputs, not vendor quotations or capacity estimates. Total cost also includes ingestion, catalog, orchestration, requests, transfer and maintenance.
 
-| Concern | What breaks first | Mitigation |
-|---|---|---|
-| Ingestion | Commit backlog and small batches | Batch writes; partition broker/workers only when throughput requires |
-| Storage layout | Small files and metadata growth | Compact files and expire snapshots |
-| Transformation | Fact MERGEs and critical DAG duration; CI contention | Bound correction lookbacks, prune affected partitions, select critical models |
-| Query concurrency | Repeated detailed-fact scans | Materialized dashboard aggregates; isolate interactive compute |
-| Replay capacity | Full-history rebuild duration | Scoped backfills on separate compute with progress checkpoints |
+| Likely pressure at 100x | Response when measured |
+|---|---|
+| Ingestion commit backlog | Larger batches; partition workers/broker if required |
+| Small files and metadata growth | Compaction and metadata maintenance |
+| Order MERGEs and critical dbt runtime | Prune affected partitions; keep routine corrections bounded without dropping old arrivals |
+| Repeated scans and query concurrency | Materialized aggregates; scan/concurrency limits and workload isolation |
+| Long backfills | Scoped rebuilds with checkpoints; separate compute if needed |
 
-### Cost Controls
-
-- Enforce approved retention; expire snapshots without shortening the promised replay window.
-- Use daily partitions and measured compaction targets; avoid frequent full scans.
-- Separate interactive, transformation and maintenance compute; set scan/concurrency limits.
-- Parquet/Iceberg support multiple engines; dbt Core/Git avoid a dbt Cloud dependency. Another Iceberg reader can replace Trino, but writes, catalog integration, SQL dialect and operations still cost effort to migrate. Keep dialect-specific SQL in a small macro layer.
+First hypothesis: commit overhead and order MERGEs exhaust the freshness budget before storage capacity. Benchmark ingestion, transformation, checks and publication for **300,000-event batches** while dashboard queries run. Verify sustained two-minute batch throughput, five-minute publication freshness and cost per million events. Inspect query plans and scanned bytes; prune scans without excluding late arrivals or required lifecycle history.
 
 ## 10. Thin Working Slice
 
-### Scope
+**Not yet implemented.** Build only the `order_delivered` path declared in section 4, through RabbitMQ into harness Postgres, plus its event-time count query. The complete lateness metric, production incremental processing and multi-team deployment remain design work.
 
-**Proposed, not yet implemented or run.** Production architecture above is separate from the harness slice.
+### Idempotency and Expected Checks
 
-- **Event type:** `courier_assigned`, demonstrating v1/v2 assignment share.
-- **Configuration:** The same dbt SQL/YAML interface described in section 4, using a registered assignment-event source.
-- **Flow:** RabbitMQ → generic ingestion → Postgres raw events → dbt/Postgres model.
-- **Idempotency mechanism:** Enforce unique event IDs in Postgres and acknowledge only persisted inputs. Replaying the same captured input twice must leave counts and results unchanged.
+Use `event_id` as the Postgres primary key; retain the validated payload alongside typed fields. Compare payloads on duplicate IDs: identical retries are accepted; conflicts go to quarantine and block affected publication while preserving the existing record. Acknowledge RabbitMQ only after the relevant data or quarantine transaction commits.
 
-### Result
+| Input | Expected result, not an observed run |
+|---|---|
+| 100 valid delivery events with distinct IDs | 100 stored rows |
+| Repeat 5 of those events | Still 100 rows |
+| One malformed timestamp | One quarantined record |
+| Replay all 106 messages | Same business rows and query output |
+| Same ID with a different payload, tested separately | Conflict reported; existing record preserved |
 
-For an explicit event-time window, report unique assignments, unique v2 assignments and v2 percentage. An empty window has no percentage.
-- **Observation window:** Unset until execution; harness event time runs at 60x wall time.
-- **Result:** Unset until execution.
-- **Independent validation:** Capture input IDs; independently count unique valid assignments/v2 IDs for that window, then compare table and replay results.
-- **Why the number is credible:** Evidence is pending; expected producer proportions are not validation.
+**Offline check:** two events occur at 10:01 and 10:04 UTC but arrive at 11:00 UTC. Both count in **[10:00, 10:05)**; neither counts in the 11:00 window. Replaying them must leave that result unchanged.
 
-### Slice Limitations
+### Live-Run Evidence to Record
 
-- **Production-like aspects:** SQL/YAML interface, event-time query and idempotent curated results.
-- **Harness-specific shortcuts:** Postgres deduplicates raw rows, unlike production audit storage; the small dataset is rebuilt each run. One event type cannot calculate late delivery by zone: that needs placement, assignment, delivery and restaurant/zone data, plus cancellation handling.
-- **First failure expected after one unattended week:** Unbounded raw growth/full rebuild time; faster harness timestamps also invalidate wall-clock lateness checks.
-- **On-call response:** Check queue lag, commit/build failures and disk; restore capacity, replay safely, then add retention and incremental processing as needed.
+Report the actual query window, unique valid input IDs, quarantined records, stored rows and query results before and after replaying the same captured inputs. Keep these observations separate from the expected checks above. The harness clock runs at 60×; use explicit event-time bounds rather than assuming its timestamps match wall-clock time.
 
 ## 11. Next Steps and Deliberate Cuts
 
-### Next Steps
+1. Agree metric semantics, thresholds, freshness, reconciliation source and retention/correction policies.
+2. Implement the slice and document its run command, observed window, query output and replay evidence.
+3. Benchmark freshness/cost and validate connector/catalog compatibility before production sizing.
 
-1. Agree metric semantics, correction/retention windows and freshness objectives with Dispatch.
-2. Implement and run the slice; record observed window, query result and replay/reconciliation evidence.
-3. Benchmark the critical path and cost at current/100x load before committing to production sizing.
-
-### Deliberately Cut
-
-| Cut | Reason | Trigger to add it |
-|---|---|---|
-| Stateful stream processor | No sub-minute SLO | Object-store commit latency plus critical dbt DAG cannot meet agreed freshness |
-| Custom UI/config compiler | Analysts already write SQL | Demonstrated workflow gap in dbt/Git |
-| dbt Semantic Layer | Portable metric tables suffice | Repeated cross-tool metric inconsistencies |
-| Federated dbt mesh | One repo simplifies ownership and deployment | Measured CI or release contention |
-| Sheets as system of record | Editable exports cannot govern metrics | None; keep it an export |
-| Full-history replay on every change | Wasteful at scale | Explicit semantic correction or recovery need |
+Defer a custom UI/config compiler, federated dbt projects and full-history rebuilds on every change. Their triggers are a demonstrated analyst workflow gap, measured release contention, or an explicit recovery/semantic correction need. Streaming and semantic-layer alternatives are evaluated below.
 
 ## Appendix: Alternatives Considered
 
-| Decision | Chosen option | Alternative | Why rejected |
-|---|---|---|---|
-| Storage | Iceberg | Naked Hive-partitioned Parquet | Atomicity and metadata would become platform-owned problems |
-| Table format | Iceberg | Delta | Prefer engine-neutral operation; Spark/Databricks-oriented tooling offers no demonstrated advantage here, though Delta is also open |
-| Processing | Microbatch dbt | Flink | Defer until the freshness budget requires stateful streaming |
-| Processing paths | One replayable SQL path | Lambda architecture | Separate batch/stream logic can drift |
-| Metrics | Materialized tables | dbt Semantic Layer | Defer added serving dependency |
-| Analyst interface | dbt SQL/YAML | Custom UI/config compiler | Duplicates existing analyst tooling |
+| Decision | Alternative | Why rejected for now / reconsider when |
+|---|---|---|
+| Lakehouse | Managed warehouse | Provisionally favor open storage and engine portability; prefer an existing warehouse if those benefits do not justify catalog, compute and maintenance operations. Compare measured freshness and total cost |
+| Iceberg storage | Plain partitioned Parquet | Would leave atomic commits and table metadata to the platform |
+| Iceberg format | Delta | Also open; no demonstrated advantage for this proposed Trino workload. Revisit with existing ecosystem investment or benchmarks |
+| dbt microbatches | Flink | No established sub-minute requirement; revisit if the validated critical path misses the agreed freshness target |
+| One SQL codebase | Separate batch/stream implementations | Duplicate business logic can drift; accept separate paths only for a demonstrated latency need |
+| dbt metric tables | [Cube](https://docs.cube.dev/docs/data-modeling/overview) or [MetricFlow](https://docs.getdbt.com/docs/build/about-metricflow) | Deliberately reject another semantic/query layer now: published tables cover the required outputs. Reconsider for dynamic metric queries or repeated cross-tool inconsistency |
+| Controlled Sheets export | Sheets as system of record | Editable formulas cannot govern operational metrics; keep it a presentation output |
