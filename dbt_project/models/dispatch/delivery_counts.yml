@@ -1,0 +1,28 @@
+version: 2
+
+models:
+  - name: delivery_counts
+    description: Delivery-event volume by five-minute occurrence window, not lateness or unique orders. Missing windows have zero events.
+    columns:
+      - name: window_start
+        description: Inclusive start of a five-minute UTC window.
+        data_type: timestamp with time zone
+        data_tests: [not_null, unique]
+      - name: delivered_events
+        description: Number of accepted unique event IDs in the window.
+        data_type: bigint
+        data_tests: [not_null]
+
+exposures:
+  - name: dispatch_dashboard
+    type: dashboard
+    description: Planned operational dashboard; this slice supplies only a SQL report.
+    owner:
+      name: Chiara
+    depends_on: [ref('delivery_counts')]
+  - name: dispatch_sheets
+    type: application
+    description: Planned controlled Sheets export; not implemented in this slice.
+    owner:
+      name: Bea
+    depends_on: [ref('delivery_counts')]

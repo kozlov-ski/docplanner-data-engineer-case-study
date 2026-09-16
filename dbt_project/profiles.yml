@@ -1,0 +1,13 @@
+nomly:
+  target: local
+  outputs:
+    local:
+      type: postgres
+      host: "{{ env_var('PGHOST', 'localhost') }}"
+      port: "{{ env_var('PGPORT', '5432') | int }}"
+      user: "{{ env_var('PGUSER', 'nomly') }}"
+      password: "{{ env_var('PGPASSWORD', 'nomly') }}"
+      dbname: "{{ env_var('PGDATABASE', 'nomly') }}"
+      schema: "{{ env_var('NOMLY_ANALYTICS_SCHEMA', 'analytics') }}"
+      threads: 1
+      connect_timeout: 10

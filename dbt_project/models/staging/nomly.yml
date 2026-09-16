@@ -1,0 +1,46 @@
+version: 2
+
+sources:
+  - name: nomly
+    schema: "{{ env_var('NOMLY_RAW_SCHEMA', 'raw') }}"
+    description: Validated delivery events ingested from RabbitMQ; rejected bytes are quarantined separately.
+    tables:
+      - name: deliveries
+        description: One accepted payload per event ID; identical retries do not change the row.
+        config:
+          meta:
+            event_type: order_delivered
+            owner: dispatch
+            freshness_class: critical
+        columns:
+          - name: event_id
+            description: Producer event identifier and ingestion deduplication key.
+            data_tests: [not_null, unique]
+          - name: order_id
+            description: Order identifier; event counts are not guaranteed to be distinct order counts.
+            data_tests: [not_null]
+          - name: occurred_at
+            description: Source event time, normalized to UTC; determines the business window.
+            data_tests: [not_null]
+          - name: ingested_at
+            description: First accepted receipt time; unchanged on replay.
+            data_tests: [not_null]
+          - name: payload
+            description: Complete accepted JSON payload, including additional fields.
+
+models:
+  - name: stg_nomly__deliveries
+    description: Typed delivery-event detail for analyst models; validation and deduplication happen at ingestion.
+    config:
+      meta:
+        owner: dispatch
+        freshness_class: critical
+    columns:
+      - name: event_id
+        description: Unique event identifier.
+      - name: order_id
+        description: Order identifier.
+      - name: occurred_at
+        description: Delivery occurrence time.
+      - name: ingested_at
+        description: First accepted receipt time.

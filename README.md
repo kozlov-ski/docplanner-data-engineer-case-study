@@ -1,34 +1,38 @@
 # Data Engineering case study
 
-Hello 👋 — everything you need for the exercise is in this repo.
+Events flow from RabbitMQ through a batch consumer and Trino into Iceberg/Parquet in MinIO.
 
-| | |
-|---|---|
-| `CASE_STUDY.md` | The brief. Start here. |
-| `harness/` | The environment you build against. `docker compose up` and you're running. |
-
-## Quick start
+Requires **Docker Compose 2.30+**, **uv** and **just**. From the repository root:
 
 ```bash
-cd harness && docker compose up
+just up
 ```
 
-That gives you RabbitMQ with a live stream of order events and Postgres pre-seeded with
-the dimension tables, in about six seconds. Both have a browser UI:
+Starts the stack and consumes continuously, printing committed batch counts.
+After the first committed batch, check from another terminal:
 
-| | |
-|---|---|
-| RabbitMQ | http://localhost:15672 — `guest` / `guest` |
-| Adminer (Postgres) | http://localhost:8081 — `nomly` / `nomly` / `nomly` |
+```bash
+just check
+```
 
-`harness/HARNESS.md` has the connection strings, the event schema, the table definitions
-and a four-line consumer to get you started.
+Shows row count and latest receipt, requires data from the last 60 seconds, and checks
+a Parquet object in MinIO. This verifies ingestion, not event validity or deduplication.
 
-## A note on the harness code
+Browse [MinIO](http://localhost:9001): `nomlyadmin` / `nomly-local-only`, bucket `nomly-lakehouse`.
 
-`harness/producer.py` is not a black box — read it if you like. It will show you how the
-events are generated, but it will not answer any of the questions in the brief, because
-none of them ask you to guess a property of the data. We're asking what you would build,
-and whether the numbers your pipeline produces can be trusted.
+Press **Ctrl-C** to stop ingestion, then choose:
 
-If anything here doesn't work, tell us — that's our bug, not yours.
+```bash
+just stop  # Preserve data; resume with just up.
+just nuke  # DELETE harness database, broker and MinIO data; start fresh with just up.
+```
+
+Ingestion scripts declare their own Python 3.12/dependencies in uv inline metadata,
+with per-script lockfiles; no Python project setup is needed.
+
+Unattended, queue backlog and small files grow. Monitor disk usage; restart failed
+ingestion with `just up`. Retries can produce duplicate raw rows.
+
+Read the [brief](CASE_STUDY.md), [design](DESIGN.md), or
+[harness instructions](harness/HARNESS.md) for connections, SQL and verification commands.
+The existing `dbt_project/` is not connected to this raw layer yet.

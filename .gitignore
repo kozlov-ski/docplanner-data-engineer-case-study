@@ -1,0 +1,11 @@
+dbt_project/.venv/
+dbt_project/.uv-cache/
+dbt_project/__pycache__/
+dbt_project/target/
+dbt_project/logs/
+dbt_project/captures/
+dbt_project/.user.yml
+harness/ingestion/.venv/
+harness/ingestion/.uv-cache/
+harness/ingestion/__pycache__/
+harness/ingestion/evidence.json

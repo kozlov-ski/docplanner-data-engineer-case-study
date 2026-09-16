@@ -9,7 +9,7 @@ Give analysts a shared dbt SQL/YAML monorepo for declaring datasets without writ
 - **Trade-off:** One transformation path reduces maintenance and batch/stream drift, but offers no continuous streaming or sub-minute latency. Iceberg adds maintenance overhead at today's scale.
 - **Serving:** Governed SQL access, a BI dashboard and alerts, plus a controlled Google Sheets export.
 
-This is a proposed architecture. The five-minute freshness target needs benchmarking; the working slice in section 10 is not yet implemented.
+This is a proposed architecture. The five-minute freshness target needs benchmarking. Section 10 records an implemented raw landing prototype; dbt migration and the final Postgres deliverable remain pending.
 
 ## 2. Requirements and Assumptions
 
@@ -402,30 +402,33 @@ First hypothesis: commit overhead and order MERGEs exhaust the freshness budget 
 
 ## 10. Thin Working Slice
 
-**Not yet implemented.** Build only the `order_delivered` path declared in section 4, through RabbitMQ into harness Postgres, plus its event-time count query. The complete lateness metric, production incremental processing and multi-team deployment remain design work.
+**Raw landing prototype implemented; the case-study deliverable is not yet complete.** Compose adds MinIO and Trino, automatically creates `lakehouse.bronze.raw_order_events`, and marks Trino healthy only after initialization and schema checks pass. A separate consumer subscribes to all events and writes batches through Trino into Iceberg v2/Parquet, partitioned by UTC ingestion day. The existing Postgres hosts the Iceberg JDBC catalog; production's proposed REST catalog remains a separate choice.
 
-### Idempotency and Expected Checks
+Raw retains original bytes, receipt time, exchange, routing key, broker redelivery flag and batch ID. Malformed payloads and duplicates remain in this prototype's Bronze table; validation/quarantine models are deferred. Acknowledge after the batch INSERT succeeds; an uncertain commit may produce duplicate raw rows on redelivery. **No raw idempotency or producer-completeness guarantee.**
 
-Use `event_id` as the Postgres primary key; retain the validated payload alongside typed fields. Compare payloads on duplicate IDs: identical retries are accepted; conflicts go to quarantine and block affected publication while preserving the existing record. Acknowledge RabbitMQ only after the relevant data or quarantine transaction commits.
+### Observed Evidence — 2026-09-16
 
-| Input | Expected result, not an observed run |
+Two bounded live runs (`--seconds 12`, then `--limit 1000 --seconds 30`) stored **1,051 messages in five Parquet files**, in the `2026-09-16` ingestion-day partition. Receipt range: **12:31:29.088782–12:39:52.411579 UTC**; ingestion was stopped between runs. All rows remained queryable after restarting MinIO/Trino and repeating Compose startup.
+
+| Routing key | Stored messages |
 |---|---|
-| 100 valid delivery events with distinct IDs | 100 stored rows |
-| Repeat 5 of those events | Still 100 rows |
-| One malformed timestamp | One quarantined record |
-| Replay all 106 messages | Same business rows and query output |
-| Same ID with a different payload, tested separately | Conflict reported; existing record preserved |
+| `order_placed` | 256 |
+| `courier_assigned` | 232 |
+| `order_picked_up` | 292 |
+| `order_delivered` | 246 |
+| `order_cancelled` | 22 |
+| `order_teleported` (producer corruption) | 3 |
 
-**Offline check:** two events occur at 10:01 and 10:04 UTC but arrive at 11:00 UTC. Both count in **[10:00, 10:05)**; neither counts in the 11:00 window. Replaying them must leave that result unchanged.
+Reproduce the inspection with `SELECT routing_key, count(*) FROM lakehouse.bronze.raw_order_events GROUP BY 1`; inspect `$partitions` and `$files` for storage evidence. These are raw message counts, not unique orders or lateness metrics.
 
-### Live-Run Evidence to Record
+**Executable checks passed:** exact bytes for nine fixture messages across all event types, duplicates, malformed JSON and non-UTF-8; receipt-day partition boundaries; size/time/partial-batch flushes; failed INSERT redelivery; duplicate preservation after commit-before-ack interruption; and broker heartbeat continuity during a slow write. A separate disposable Compose project verified fresh initialization, repeat startup, restart preservation, and explicit failure for invalid SQL or incompatible existing columns. The existing harness Postgres volume was retained.
 
-Report the actual query window, unique valid input IDs, quarantined records, stored rows and query results before and after replaying the same captured inputs. Keep these observations separate from the expected checks above. The harness clock runs at 60×; use explicit event-time bounds rather than assuming its timestamps match wall-clock time.
+**Deferred:** `dbt_project/` is unchanged. Connect it to raw Iceberg inputs, implement curated validation/deduplication, and complete the brief's one-event idempotent Postgres output and Chiara query. Run instructions and persistence limits are in README; this prototype is not evidence for the production freshness/cost target.
 
 ## 11. Next Steps and Deliberate Cuts
 
 1. Agree metric semantics, thresholds, freshness, reconciliation source and retention/correction policies.
-2. Implement the slice and document its run command, observed window, query output and replay evidence.
+2. Connect the raw landing layer to dbt and complete the required one-event idempotent Postgres output, query and replay evidence.
 3. Benchmark freshness/cost and validate connector/catalog compatibility before production sizing.
 
 Defer a custom UI/config compiler, federated dbt projects and full-history rebuilds on every change. Their triggers are a demonstrated analyst workflow gap, measured release contention, or an explicit recovery/semantic correction need. Streaming and semantic-layer alternatives are evaluated below.
