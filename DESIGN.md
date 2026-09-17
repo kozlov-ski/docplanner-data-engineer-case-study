@@ -401,53 +401,11 @@ First hypothesis: commit overhead and order MERGEs exhaust the freshness budget 
 
 ## 10. Thin Working Slice
 
-**Raw landing and dbt delivery-event counts implemented; the case-study deliverable is not yet complete.** Compose adds MinIO and Trino, automatically creates `lakehouse.bronze.raw_order_events`, and marks Trino healthy only after initialization and schema checks pass. A separate consumer subscribes to all events and writes batches through Trino into Iceberg v2/Parquet, partitioned by UTC ingestion day. The existing Postgres hosts the Iceberg JDBC catalog; production's proposed REST catalog remains a separate choice.
-
-Raw retains original bytes, receipt time, exchange, routing key, broker redelivery flag and batch ID. Malformed payloads and duplicates remain in Bronze. Acknowledge after the batch INSERT succeeds; an uncertain commit may produce duplicate raw rows on redelivery. **No raw idempotency or producer-completeness guarantee.**
-
-`just dbt` runs a checked build into `lakehouse.analytics`. An incremental input table captures candidates whose routing key or JSON event type is `order_delivered`, retaining bytes and rejection reasons. Valid UTF-8 JSON objects require UUID identifiers and timezone-aware RFC 3339 timestamps with at most microsecond precision. The delivery-detail view deduplicates identical bytes by event ID and keeps the earliest receipt. Any different bytes sharing a valid event ID—even formatting-only changes or rejected variants—fail an upstream test and skip replacement of the count table. Captured inputs, including conflicts, remain committed; the existing detail view reflects those inputs, so it must only be consumed after a successful build. Old counts remain queryable but stale after failure; this is not atomic publication. Run only one dbt build at a time.
-
-**Incremental inputs:** `stg_nomly__delivery_inputs` is an Iceberg v2/Parquet table partitioned by `day(ingested_at)`, using dbt's `append` strategy. Normal runs restrict both raw and captured-input scans to the current and previous UTC ingestion-day partitions. `delivery_input_lookback_days` defaults to 2; `delivery_input_as_of_date` defaults to the run's UTC date. Append candidates from unseen `(batch_id, ingestion day)` pairs, including duplicates and malformed candidates. Including the day handles batches that cross midnight. The consumer assigns a fresh batch ID to each atomic INSERT; IDs must be immutable, complete and never reused. Captured rows and progress commit together.
-
-Event timestamps do not filter discovery: an old delivery received today remains eligible. Old **receipt dates** outside the window need an explicit backfill, including missed partitions after a prolonged dbt outage. This window is a scan policy, not an event-time watermark or the proposed 24-hour business correction boundary. Initial creation and full refresh read all retained history; validation/SQL changes and source corrections/deletions require full refresh. A one-time full refresh applies partitioning to the previous unpartitioned input table.
-
-Batches with no delivery candidates can be rescanned within the selected partitions because they leave no target rows. Conflict checks still scan accumulated inputs, and counts still rebuild fully and correct all captured occurrence windows. The proposed 24-hour correction/backfill workflow remains unimplemented. Require incremental-versus-full reconciliation over the same captured range, and backfill missed receipt dates before claiming complete counts.
-
-### Observed Evidence — 2026-09-16
-
-Two bounded live runs (`--seconds 12`, then `--limit 1000 --seconds 30`) stored **1,051 messages in five Parquet files**, in the `2026-09-16` ingestion-day partition. Receipt range: **12:31:29.088782–12:39:52.411579 UTC**; ingestion was stopped between runs. All rows remained queryable after restarting MinIO/Trino and repeating Compose startup.
-
-| Routing key | Stored messages |
-|---|---|
-| `order_placed` | 256 |
-| `courier_assigned` | 232 |
-| `order_picked_up` | 292 |
-| `order_delivered` | 246 |
-| `order_cancelled` | 22 |
-| `order_teleported` (producer corruption) | 3 |
-
-Reproduce the inspection with `SELECT routing_key, count(*) FROM lakehouse.bronze.raw_order_events GROUP BY 1`; inspect `$partitions` and `$files` for storage evidence. These are raw message counts, not unique orders or lateness metrics.
-
-**Executable checks passed:** exact bytes for nine fixture messages across all event types, duplicates, malformed JSON and non-UTF-8; receipt-day partition boundaries; size/time/partial-batch flushes; failed INSERT redelivery; duplicate preservation after commit-before-ack interruption; and broker heartbeat continuity during a slow write. A separate disposable Compose project verified fresh initialization, repeat startup, restart preservation, and explicit failure for invalid SQL or incompatible existing columns. The existing harness Postgres volume was retained.
-
-### Observed dbt Evidence — 2026-09-16 13:12 UTC
-
-`just dbt` passed with dbt Core **1.12.5**, dbt-trino **1.10.3** and Trino **483**: three models and all **11 data tests** succeeded. Its captured live input contained **1,399 delivery candidates: 1,355 unique valid IDs, 42 duplicate valid receipts and two rejected candidates**. An independent Python calculation from the captured bytes matched every staged ID, first receipt timestamp and all **151 five-minute windows**, covering **[2026-09-16 13:20, 2026-09-17 01:55) UTC**. The producer's 60× simulated clock explains future occurrence times; ingestion time is not substituted.
-
-| Query output: UTC window start | Delivery events |
-|---|---|
-| 2026-09-16 13:20 | 4 |
-| 2026-09-16 13:25 | 4 |
-| 2026-09-16 13:30 | 7 |
-
-These are the first three rows of `SELECT window_start, delivered_events FROM lakehouse.analytics.delivery_counts ORDER BY window_start`. The complete observed output is in the generated `dbt_project/target/lakehouse_evidence.json`; reruns capture a new input snapshot.
-
-**Isolated fixtures:** 100 distinct valid IDs + five duplicates + one invalid timestamp produced **100 accepted IDs and one rejected candidate**. Output for **2026-01-01 [10:00, 10:15) UTC** was **10:00 → 41, 10:05 → 45, 10:10 → 14**. Re-appending the batch doubled raw candidates to 212, including two rejected receipts, while accepted rows, earliest receipts and all counts stayed identical. Shuffled/delayed arrivals, offset timestamps and exact/microsecond window boundaries reconciled independently. Invalid UTF-8/JSON, identifiers, event type and timestamps were rejected. A later arrival stayed outside the captured build and appeared on the next rebuild. Changed-field and formatting-only conflicts skipped the count model and preserved the previous result. Invalid SQL, malformed YAML and contract mismatch failed. All verification schemas were removed; live ingestion was not interrupted.
-
-**Deferred:** the brief's one-event idempotent Postgres output, operational scheduling/publication and multi-event lateness metrics. Run instructions and persistence limits are in README and HARNESS; this prototype is not evidence for the production freshness/cost target.
-
-**Windowed-input verification — 2026-09-16 13:54 UTC:** Docker checks passed for the default two-day ingestion window, one-day mode, exclusive upper bounds, old-event/recent-receipt handling, explicit historical backfill and a batch spanning UTC midnight. With four stored ingestion-day partitions, `EXPLAIN (TYPE IO)` on the compiled model showed both Bronze and captured-input scans constrained to **[2026-01-02, 2026-01-03) UTC**. No-op and failed-build retries left input rows/files unchanged; new replay batches retained duplicates while business counts stayed stable. Inputs and counts matched a full refresh after backfilling. Invalid window settings, SQL, contracts and conflicts failed as expected. Live reconciliation matched **6,163 unique deliveries**; all verification schemas and objects were removed. The live input table was rebuilt once to apply ingestion-day partitioning; `stg_nomly__deliveries` remains a view.
-
+- **Ingestion:** RabbitMQ → batch consumer → Trino → Iceberg/Parquet in MinIO. Preserve raw bytes and receipt metadata; acknowledge after commit. Raw duplicates remain possible.
+- **dbt interface:** SQL/YAML models select and validate `order_delivered`, deduplicate by event ID, and rebuild delivery counts in five-minute UTC event-time windows. Conflicting payloads block count replacement.
+- **Incremental processing:** Scan today’s and yesterday’s ingestion partitions, skipping captured batches. Older events arriving today are included; missed older receipt dates require explicit backfill.
+- **Verification:** `just dbt-verify` independently reconciles inputs and counts, checks replay stability, delayed arrivals, invalid payloads, conflicts and backfill/full-refresh equivalence. The recorded fixture returned **41, 45 and 14 deliveries** for the three windows in **2026-01-01 [10:00, 10:15) UTC**, unchanged after replay.
+- **Limits:** This counts delivery events, not late deliveries. Idempotent Postgres output remains incomplete; scheduling and atomic publication are deferred. Failed builds can leave stale counts.
 
 ## 11. Next Steps and Deliberate Cuts
 
