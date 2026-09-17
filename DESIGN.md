@@ -407,14 +407,6 @@ First hypothesis: commit overhead and order MERGEs exhaust the freshness budget 
 - **Verification:** `just dbt-verify` independently reconciles inputs and counts, checks replay stability, delayed arrivals, invalid payloads, conflicts and backfill/full-refresh equivalence. The recorded fixture returned **41, 45 and 14 deliveries** for the three windows in **2026-01-01 [10:00, 10:15) UTC**, unchanged after replay.
 - **Limits:** This counts delivery events, not late deliveries. Idempotent Postgres output remains incomplete; scheduling and atomic publication are deferred. Failed builds can leave stale counts.
 
-## 11. Next Steps and Deliberate Cuts
-
-1. Agree metric semantics, thresholds, freshness, reconciliation source and retention/correction policies.
-2. Complete the required one-event idempotent Postgres output and its query/replay evidence using the validated lakehouse detail.
-3. Benchmark freshness/cost and validate connector/catalog compatibility before production sizing.
-
-Defer a custom UI/config compiler, federated dbt projects and full-history rebuilds on every change. Their triggers are a demonstrated analyst workflow gap, measured release contention, or an explicit recovery/semantic correction need. Streaming and semantic-layer alternatives are evaluated below.
-
 ## Appendix: Alternatives Considered
 
 | Decision | Alternative | Why rejected for now / reconsider when |
