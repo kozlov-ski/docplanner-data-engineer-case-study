@@ -32,7 +32,7 @@ def table_name(value):
 
 def trino_connection():
     return connect(
-        host=os.getenv("TRINO_HOST", "localhost"),
+        host=os.getenv("TRINO_HOST", "127.0.0.1"),
         port=int(os.getenv("TRINO_PORT", "8080")),
         user=os.getenv("TRINO_USER", "ingestion"),
         timezone="UTC", request_timeout=10, max_attempts=1,

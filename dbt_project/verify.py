@@ -24,7 +24,7 @@ UTC = timezone.utc
 
 
 def query(sql, parameters=None):
-    connection = connect(host=os.getenv("TRINO_HOST", "localhost"),
+    connection = connect(host=os.getenv("TRINO_HOST", "127.0.0.1"),
                          port=int(os.getenv("TRINO_PORT", "8080")),
                          user=os.getenv("TRINO_USER", "dbt_verify"), timezone="UTC",
                          request_timeout=30, max_attempts=1)

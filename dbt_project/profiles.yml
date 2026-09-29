@@ -4,7 +4,7 @@ nomly:
     local:
       type: trino
       method: none
-      host: "{{ env_var('TRINO_HOST', 'localhost') }}"
+      host: "{{ env_var('TRINO_HOST', '127.0.0.1') }}"
       port: "{{ env_var('TRINO_PORT', '8080') | int }}"
       user: "{{ env_var('TRINO_USER', 'dbt') }}"
       database: "{{ env_var('TRINO_CATALOG', 'lakehouse') }}"

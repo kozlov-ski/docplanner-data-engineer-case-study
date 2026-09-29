@@ -63,4 +63,24 @@ Verify storage layer at [local Minio instance](localhost:9000)
 ## Step 4
 Run Trino verification query
 
+```
+docker compose -f harness/docker-compose.yml exec trino trino
+```
+
+Then in Trino:
+
+```sql
+SHOW SCHEMAS FROM lakehouse;
+
+SELECT table_schema, table_name, table_type
+FROM lakehouse.information_schema.tables
+WHERE table_schema IN ('bronze', 'analytics')
+ORDER BY table_schema, table_name;
+
+DESCRIBE lakehouse.bronze.raw_order_events;
+SELECT file_path, file_format, record_count
+FROM lakehouse.bronze."raw_order_events$files"
+LIMIT 10;
+```
+
 ![](resources/step-4.png)
