@@ -84,3 +84,71 @@ LIMIT 10;
 ```
 
 ![](resources/step-4.png)
+
+## Demo: follow the data
+
+In the Trino CLI from Step 4, run these in order. Run `just dbt` in another
+terminal first; an unsuccessful build leaves the previous analytics counts stale.
+
+1. **Bronze — all events arrive as raw bytes.** Compare receipt time with the
+   event's own timestamp. Decode the payload for display; malformed JSON is
+   shown as text rather than silently excluded.
+
+   ```sql
+   SELECT routing_key, count(*) AS raw_rows, max(ingested_at) AS latest_receipt
+   FROM lakehouse.bronze.raw_order_events
+   GROUP BY 1 ORDER BY 1;
+
+   SELECT ingested_at, routing_key,
+          json_extract_scalar(try(json_parse(from_utf8(payload))), '$.occurred_at') AS occurred_at,
+          coalesce(json_format(try(json_parse(from_utf8(payload)))),
+                   from_utf8(payload)) AS payload_text
+   FROM lakehouse.bronze.raw_order_events
+   ORDER BY ingested_at DESC LIMIT 10;
+   ```
+
+2. **Captured delivery inputs — validate candidate events.** A null rejection
+   reason means the candidate passed validation.
+
+   ```sql
+   SELECT count(*) AS candidate_rows,
+          count_if(rejection_reason IS NULL) AS valid_rows,
+          count_if(rejection_reason IS NOT NULL) AS rejected_rows,
+          max(ingested_at) AS latest_captured_receipt
+   FROM lakehouse.analytics.stg_nomly__delivery_inputs;
+
+   SELECT rejection_reason, count(*) AS rows
+   FROM lakehouse.analytics.stg_nomly__delivery_inputs
+   GROUP BY 1 ORDER BY rows DESC;
+   ```
+
+3. **Delivery detail — remove identical event-ID retries.** The input table
+   retains duplicates; the view exposes validated, deduplicated events.
+
+   ```sql
+   SELECT count(*) AS valid_input_rows,
+          count(DISTINCT event_id) AS distinct_event_ids
+   FROM lakehouse.analytics.stg_nomly__delivery_inputs
+   WHERE rejection_reason IS NULL;
+
+   SELECT event_id, order_id, occurred_at, ingested_at
+   FROM lakehouse.analytics.stg_nomly__deliveries
+   ORDER BY occurred_at DESC LIMIT 10;
+   ```
+
+4. **Delivery counts — group by five-minute occurrence-time windows.** Check
+   that published counts reconcile with the detail after a successful build.
+
+   ```sql
+   SELECT window_start, delivered_events
+   FROM lakehouse.analytics.delivery_counts
+   ORDER BY window_start DESC LIMIT 10;
+
+   SELECT count(*) AS detail_events,
+          (SELECT coalesce(sum(delivered_events), 0)
+           FROM lakehouse.analytics.delivery_counts) AS counted_events
+   FROM lakehouse.analytics.stg_nomly__deliveries;
+   ```
+
+For the physical side, the `raw_order_events$files` query in Step 4 lists the
+Parquet objects; browse them in the `nomly-lakehouse` bucket in [MinIO](http://localhost:9001).
